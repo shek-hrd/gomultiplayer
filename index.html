@@ -1,0 +1,136 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>GOMultiplayer – Click Race</title>
+  <style>
+    body{margin:0;font-family:sans-serif;background:#111;color:#eee}
+    #ui{position:fixed;top:0;left:0;right:0;background:#222;padding:8px;text-align:center}
+    #gameCanvas{background:#000;display:block;margin:60px auto;border:1px solid #444}
+    button{margin:0 6px;padding:6px 12px}
+  </style>
+</head>
+<body>
+
+<div id="ui">
+  <span id="status">Loading…</span>
+  <button id="hostBtn" hidden>Host Game</button>
+  <button id="joinBtn" hidden>Join Game</button>
+  <span id="codeDisplay"></span>
+</div>
+
+<canvas id="gameCanvas" width="600" height="400"></canvas>
+
+<!-- NetplayJS -->
+<script src="https://unpkg.com/netplayjs@0.4.1/dist/netplay.js"></script>
+
+<script>
+/******************************************************************
+ * 1)  GAME DEFINITION
+ ******************************************************************/
+class ClickRaceGame extends NetplayGame {
+  constructor() {
+    super();
+    this.players = {};        // id -> { x, y, score }
+    this.localId = null;      // our own id
+    this.winner = null;
+  }
+
+  /***** 1a)  Initial state *****/
+  static getInitialState() {
+    return new ClickRaceGame();
+  }
+
+  /***** 1b)  Player joins *****/
+  playerJoin(id, isLocal) {
+    this.players[id] = { x: Math.random() * 550, y: Math.random() * 350, score: 0 };
+    if (isLocal) this.localId = id;
+  }
+
+  /***** 1c)  Player leaves *****/
+  playerLeave(id) {
+    delete this.players[id];
+  }
+
+  /***** 1d)  Input handling *****/
+  handleInput(input, id) {
+    if (this.winner) return;           // ignore after win
+    const p = this.players[id];
+    if (input.click && p) {
+      p.score += 1;
+      if (p.score >= 10) this.winner = id;
+    }
+  }
+
+  /***** 1e)  Update *****/
+  update() {
+    // nothing deterministic to run; NetplayJS drives inputs.
+  }
+
+  /***** 1f)  Render *****/
+  render(ctx) {
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    for (const [id, p] of Object.entries(this.players)) {
+      ctx.fillStyle = id === this.localId ? "#0f0" : "#f00";
+      ctx.beginPath();
+      ctx.arc(p.x + 15, p.y + 15, 15, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.fillText(p.score, p.x, p.y - 5);
+    }
+    if (this.winner) {
+      ctx.fillStyle = "#fff";
+      ctx.font = "32px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`Winner: ${this.winner === this.localId ? "You" : "Other"}!`, 300, 200);
+    }
+  }
+}
+
+/******************************************************************
+ * 2)  NETPLAYJS BOOTSTRAP (single file)
+ ******************************************************************/
+const canvas = document.getElementById("gameCanvas");
+const ctx     = canvas.getContext("2d");
+
+const app = new NetplayApp(ClickRaceGame, /* deterministic */ false);
+app.setRenderer(game => game.render(ctx));
+
+app.on("connecting", () => status.textContent = "Connecting…");
+app.on("connected",  () => status.textContent = "Connected");
+app.on("disconnected", () => status.textContent = "Disconnected");
+
+/******************************************************************
+ * 3)  SIMPLE UI
+ ******************************************************************/
+const status      = document.getElementById("status");
+const hostBtn     = document.getElementById("hostBtn");
+const joinBtn     = document.getElementById("joinBtn");
+const codeDisplay = document.getElementById("codeDisplay");
+
+app.on("readyToHost", () => hostBtn.hidden = false);
+app.on("readyToJoin", () => joinBtn.hidden = false);
+
+hostBtn.onclick = () => {
+  const code = app.host();
+  codeDisplay.textContent = `Room code: ${code}`;
+  hostBtn.hidden = joinBtn.hidden = true;
+};
+
+joinBtn.onclick = () => {
+  const code = prompt("Enter room code:");
+  if (code) app.join(code.trim());
+  hostBtn.hidden = joinBtn.hidden = true;
+};
+
+/******************************************************************
+ * 4)  MOUSE INPUT
+ ******************************************************************/
+canvas.addEventListener("click", () => app.sendInput({ click: true }));
+
+/******************************************************************
+ * 5)  START
+ ******************************************************************/
+app.start();
+</script>
+</body>
+</html>
