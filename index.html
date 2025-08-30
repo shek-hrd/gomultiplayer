@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>GOMultiplayer – Click Race</title>
+  <title>GOMultiplayer – Click Race (P2P)</title>
   <style>
     body{margin:0;font-family:sans-serif;background:#111;color:#eee}
     #ui{position:fixed;top:0;left:0;right:0;background:#222;padding:8px;text-align:center}
@@ -13,7 +13,7 @@
 <body>
 
 <div id="ui">
-  <span id="status">Loading…</span>
+  <span id="status">Connecting to signaller…</span>
   <button id="hostBtn" hidden>Host Game</button>
   <button id="joinBtn" hidden>Join Game</button>
   <span id="codeDisplay"></span>
@@ -21,116 +21,193 @@
 
 <canvas id="gameCanvas" width="600" height="400"></canvas>
 
-<!-- NetplayJS -->
-<script src="https://unpkg.com/netplayjs@0.4.1/dist/netplay.js"></script>
-
 <script>
-/******************************************************************
- * 1)  GAME DEFINITION
- ******************************************************************/
-class ClickRaceGame extends NetplayGame {
-  constructor() {
-    super();
-    this.players = {};        // id -> { x, y, score }
-    this.localId = null;      // our own id
-    this.winner = null;
-  }
+/* ------------------------------------------------------------------
+ * 1)  Signalling layer (Socket.IO client ➜ wss://network-dating-signaler.onrender.com)
+ * ------------------------------------------------------------------ */
+const SIGNAL_URL = 'wss://network-dating-signaler.onrender.com';
+const socket = io(SIGNAL_URL, { transports: ['websocket'] });
 
-  /***** 1a)  Initial state *****/
-  static getInitialState() {
-    return new ClickRaceGame();
-  }
+let myId      = null;   // our socket id
+let peerId    = null;   // the other guy
+let rtcConn   = null;   // RTCPeerConnection
+let dataChan  = null;   // RTCDataChannel
 
-  /***** 1b)  Player joins *****/
-  playerJoin(id, isLocal) {
-    this.players[id] = { x: Math.random() * 550, y: Math.random() * 350, score: 0 };
-    if (isLocal) this.localId = id;
-  }
+socket.on('connect', () => {
+  myId = socket.id;
+  status.textContent = 'Connected to signaller';
+  hostBtn.hidden = joinBtn.hidden = false;
+});
 
-  /***** 1c)  Player leaves *****/
-  playerLeave(id) {
-    delete this.players[id];
-  }
+socket.on('users-present', ids => {
+  // if somebody is already here, enable Join button
+  if (ids.length) joinBtn.hidden = false;
+});
 
-  /***** 1d)  Input handling *****/
-  handleInput(input, id) {
-    if (this.winner) return;           // ignore after win
-    const p = this.players[id];
-    if (input.click && p) {
-      p.score += 1;
-      if (p.score >= 10) this.winner = id;
-    }
-  }
+socket.on('user-joined', id => {
+  // somebody just arrived, let me join him
+  if (!rtcConn) joinBtn.hidden = false;
+});
 
-  /***** 1e)  Update *****/
-  update() {
-    // nothing deterministic to run; NetplayJS drives inputs.
-  }
+socket.on('user-left', id => {
+  if (id === peerId) resetGame('Peer left');
+});
 
-  /***** 1f)  Render *****/
-  render(ctx) {
-    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    for (const [id, p] of Object.entries(this.players)) {
-      ctx.fillStyle = id === this.localId ? "#0f0" : "#f00";
-      ctx.beginPath();
-      ctx.arc(p.x + 15, p.y + 15, 15, 0, 2 * Math.PI);
-      ctx.fill();
-      ctx.fillText(p.score, p.x, p.y - 5);
-    }
-    if (this.winner) {
-      ctx.fillStyle = "#fff";
-      ctx.font = "32px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(`Winner: ${this.winner === this.localId ? "You" : "Other"}!`, 300, 200);
-    }
+socket.on('signal', async ({ from, signal }) => {
+  peerId = from;
+  if (signal.type === 'offer')  await handleOffer(signal);
+  if (signal.type === 'answer') await handleAnswer(signal);
+  if (signal.candidate)         rtcConn.addIceCandidate(signal);
+});
+
+/* ------------------------------------------------------------------
+ * 2)  WebRTC boiler-plate
+ * ------------------------------------------------------------------ */
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+function createPeer(isInitiator) {
+  rtcConn = new RTCPeerConnection(ICE);
+
+  rtcConn.onicecandidate = e => {
+    if (e.candidate) socket.emit('signal', { to: peerId, from: myId, signal: e.candidate });
+  };
+
+  rtcConn.onconnectionstatechange = () => {
+    if (rtcConn.connectionState === 'connected') status.textContent = 'P2P connected!';
+    if (rtcConn.connectionState === 'disconnected') resetGame('Peer disconnected');
+  };
+
+  if (isInitiator) {
+    dataChan = rtcConn.createDataChannel('game');
+    setupDataChannel(dataChan);
+    rtcConn.createOffer()
+      .then(o => rtcConn.setLocalDescription(o))
+      .then(() => socket.emit('signal', { to: peerId, from: myId, signal: rtcConn.localDescription }));
+  } else {
+    rtcConn.ondatachannel = e => {
+      dataChan = e.channel;
+      setupDataChannel(dataChan);
+    };
   }
 }
 
-/******************************************************************
- * 2)  NETPLAYJS BOOTSTRAP (single file)
- ******************************************************************/
-const canvas = document.getElementById("gameCanvas");
-const ctx     = canvas.getContext("2d");
+function setupDataChannel(chan) {
+  chan.onopen    = () => status.textContent = 'P2P data channel open';
+  chan.onmessage = e => handleRemoteMessage(JSON.parse(e.data));
+  chan.onclose   = ()  => resetGame('Data channel closed');
+}
 
-const app = new NetplayApp(ClickRaceGame, /* deterministic */ false);
-app.setRenderer(game => game.render(ctx));
+function send(msg) {
+  if (dataChan && dataChan.readyState === 'open') dataChan.send(JSON.stringify(msg));
+}
 
-app.on("connecting", () => status.textContent = "Connecting…");
-app.on("connected",  () => status.textContent = "Connected");
-app.on("disconnected", () => status.textContent = "Disconnected");
+async function handleOffer(offer) {
+  createPeer(false);
+  await rtcConn.setRemoteDescription(offer);
+  const answer = await rtcConn.createAnswer();
+  await rtcConn.setLocalDescription(answer);
+  socket.emit('signal', { to: peerId, from: myId, signal: answer });
+}
 
-/******************************************************************
- * 3)  SIMPLE UI
- ******************************************************************/
-const status      = document.getElementById("status");
-const hostBtn     = document.getElementById("hostBtn");
-const joinBtn     = document.getElementById("joinBtn");
-const codeDisplay = document.getElementById("codeDisplay");
+async function handleAnswer(answer) {
+  await rtcConn.setRemoteDescription(answer);
+}
 
-app.on("readyToHost", () => hostBtn.hidden = false);
-app.on("readyToJoin", () => joinBtn.hidden = false);
+/* ------------------------------------------------------------------
+ * 3)  Game state & UI
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('gameCanvas');
+const ctx     = canvas.getContext('2d');
+const status  = document.getElementById('status');
+const hostBtn = document.getElementById('hostBtn');
+const joinBtn = document.getElementById('joinBtn');
+const codeDisplay = document.getElementById('codeDisplay');
+
+let players = {};   // id -> {x, y, score}
+let winner  = null;
 
 hostBtn.onclick = () => {
-  const code = app.host();
-  codeDisplay.textContent = `Room code: ${code}`;
-  hostBtn.hidden = joinBtn.hidden = true;
+  socket.emit('users-present', []); // trigger users-present
+  const ids = [...document.querySelectorAll('#ui span')].map(s => s.id); // dummy
+  const partner = prompt('Ask the other player to paste your ID below:\n' + myId);
+  if (partner) {
+    peerId = partner;
+    createPeer(true);
+    hostBtn.hidden = joinBtn.hidden = true;
+    codeDisplay.textContent = 'Hosting ' + myId;
+  }
 };
 
 joinBtn.onclick = () => {
-  const code = prompt("Enter room code:");
-  if (code) app.join(code.trim());
-  hostBtn.hidden = joinBtn.hidden = true;
+  const code = prompt('Enter host ID:');
+  if (code) {
+    peerId = code;
+    createPeer(false);
+    hostBtn.hidden = joinBtn.hidden = true;
+    codeDisplay.textContent = 'Joining ' + peerId;
+  }
 };
 
-/******************************************************************
- * 4)  MOUSE INPUT
- ******************************************************************/
-canvas.addEventListener("click", () => app.sendInput({ click: true }));
+/* ------------------------------------------------------------------
+ * 4)  Game logic
+ * ------------------------------------------------------------------ */
+function resetGame(msg) {
+  status.textContent = msg || 'Reset';
+  players = {};
+  winner  = null;
+  rtcConn = null;
+  dataChan = null;
+  hostBtn.hidden = joinBtn.hidden = false;
+  codeDisplay.textContent = '';
+}
 
-/******************************************************************
- * 5)  START
- ******************************************************************/
-app.start();
+function updateGame(msg) {
+  if (msg.players) players = msg.players;
+  if (msg.winner)  winner = msg.winner;
+  draw();
+}
+
+function handleRemoteMessage(msg) {
+  if (msg.type === 'state') updateGame(msg);
+}
+
+function broadcastState() {
+  send({ type: 'state', players, winner });
+}
+
+canvas.addEventListener('click', () => {
+  if (winner) return;
+  if (!players[myId]) players[myId] = { x: 50, y: 50, score: 0 };
+  players[myId].score += 1;
+  if (players[myId].score >= 10) winner = myId;
+  broadcastState();
+});
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const [id, p] of Object.entries(players)) {
+    ctx.fillStyle = id === myId ? '#0f0' : '#f00';
+    ctx.beginPath();
+    ctx.arc(p.x + 15, p.y + 15, 15, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillText(p.score, p.x, p.y - 5);
+  }
+  if (winner) {
+    ctx.fillStyle = '#fff';
+    ctx.font = '32px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Winner: ${winner === myId ? 'You' : 'Peer'}!`, 300, 200);
+  }
+}
+
+setInterval(draw, 1000 / 60); // 60 fps render
+
+/* ------------------------------------------------------------------
+ * 5)  Load Socket.IO client
+ * ------------------------------------------------------------------ */
+const s = document.createElement('script');
+s.src = 'https://cdn.socket.io/4.7.2/socket.io.min.js';
+document.head.appendChild(s);
 </script>
 </body>
 </html>
